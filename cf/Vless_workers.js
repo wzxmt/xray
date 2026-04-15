@@ -6,10 +6,11 @@ import { connect } from 'cloudflare:sockets';
 // [Windows] Press "Win + R", input cmd and run:  Powershell -NoExit -Command "[guid]::NewGuid()"
 let userID = '0aebbc46-f0bd-4cf0-9fcc-d579ccfc988d';
 
-const proxyIPs = ['cdn-all.xn--b6gac.eu.org', 'cdn.xn--b6gac.eu.org', 'cdn-b100.xn--b6gac.eu.org', 'edgetunnel.anycast.eu.org', 'cdn.anycast.eu.org'];
+const proxyIPs = ['proxyip.cmliussss.net'];
 const cn_hostnames = [''];
 
 let proxyIP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
+let proxyPort = proxyIP.match(/:(\d+)$/) ? proxyIP.match(/:(\d+)$/)[1] : '443';
 
 if (!isValidUUID(userID)) {
     throw new Error('uuid is not valid');
@@ -18,8 +19,33 @@ if (!isValidUUID(userID)) {
 export default {
     async fetch(request, env, ctx) {
         try {
-            userID = env.uuid || userID;
-            proxyIP = env.proxyip || proxyIP;
+            const { proxyip } = env;
+            if (proxyip) {
+                if (proxyip.includes(']:')) {
+                    let lastColonIndex = proxyip.lastIndexOf(':');
+                    proxyPort = proxyip.slice(lastColonIndex + 1);
+                    proxyIP = proxyip.slice(0, lastColonIndex);
+
+                } else if (!proxyip.includes(']:') && !proxyip.includes(']')) {
+                    [proxyIP, proxyPort = '443'] = proxyip.split(':');
+                } else {
+                    proxyPort = '443';
+                    proxyIP = proxyip;
+                }
+            } else {
+                if (proxyIP.includes(']:')) {
+                    let lastColonIndex = proxyIP.lastIndexOf(':');
+                    proxyPort = proxyIP.slice(lastColonIndex + 1);
+                    proxyIP = proxyIP.slice(0, lastColonIndex);
+                } else {
+                    const match = proxyIP.match(/^(.*?)(?::(\d+))?$/);
+                    proxyIP = match[1];
+                    let proxyPort = match[2] || '443';
+                    console.log("IP:", proxyIP, "Port:", proxyPort);
+                }
+            }
+            console.log('ProxyIP:', proxyIP);
+            console.log('ProxyPort:', proxyPort);
             const upgradeHeader = request.headers.get('Upgrade');
             if (!upgradeHeader || upgradeHeader !== 'websocket') {
                 const url = new URL(request.url);
@@ -33,8 +59,8 @@ export default {
                         });
 
                     case `/${userID}`: {
-                        const vsConfig = getVSConfig(userID, request.headers.get('Host'));
-                        return new Response(`${vsConfig}`, {
+                        const QistConfig = getQistConfig(userID, request.headers.get('Host'));
+                        return new Response(`${QistConfig}`, {
                             status: 200,
                             headers: {
                                 "Content-Type": "text/plain;charset=utf-8",
@@ -50,7 +76,7 @@ export default {
                         return await fetch(request);
                 }
             } else {
-                return await vsOverWSHandler(request);
+                return await QistOverWSHandler(request);
             }
         } catch (err) {
 			/** @type {Error} */ let e = err;
@@ -59,7 +85,7 @@ export default {
     },
 };
 
-async function vsOverWSHandler(request) {
+async function QistOverWSHandler(request) {
 
     const webSocketPair = new WebSocketPair();
     const [client, webSocket] = Object.values(webSocketPair);
@@ -103,7 +129,7 @@ async function vsOverWSHandler(request) {
                 rawDataIndex,
                 vsVersion = new Uint8Array([0, 0]),
                 isUDP,
-            } = await processVlessHeader(chunk, userID);
+            } = await processQistHeader(chunk, userID);
             address = addressRemote;
             portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '
                 } `;
@@ -171,6 +197,67 @@ async function checkUuidInApiResponse(targetUuid) {
 
 
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, vsResponseHeader, log,) {
+    function isIPv4Address(host) {
+        return /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host);
+    }
+
+    function isIPv6Address(host) {
+        return /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
+    }
+
+    function normalizeHost(host) {
+        const trimmed = `${host || ''}`.trim();
+        if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+            return trimmed.slice(1, -1);
+        }
+        return trimmed;
+    }
+
+    async function resolveToIP(host) {
+        const normalized = normalizeHost(host);
+        if (!normalized) {
+            return '';
+        }
+        if (isIPv4Address(normalized)) {
+            return normalized;
+        }
+        if (isIPv6Address(normalized)) {
+            return normalized;
+        }
+        const aResp = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(normalized)}&type=A`, {
+            headers: {
+                accept: 'application/dns-json',
+            },
+        });
+        if (aResp.ok) {
+            const data = await aResp.json();
+            const answers = Array.isArray(data.Answer) ? data.Answer : [];
+            const ipV4 = answers
+                .filter((a) => a && a.type === 1 && typeof a.data === 'string')
+                .map((a) => a.data)
+                .find((a) => isIPv4Address(a));
+            if (ipV4) {
+                return ipV4;
+            }
+        }
+
+        const aaaaResp = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(normalized)}&type=AAAA`, {
+            headers: {
+                accept: 'application/dns-json',
+            },
+        });
+        if (!aaaaResp.ok) {
+            return '';
+        }
+        const aaaaData = await aaaaResp.json();
+        const aaaaAnswers = Array.isArray(aaaaData.Answer) ? aaaaData.Answer : [];
+        const ipV6 = aaaaAnswers
+            .filter((a) => a && a.type === 28 && typeof a.data === 'string')
+            .map((a) => a.data)
+            .find((a) => isIPv6Address(a));
+        return ipV6 || '';
+    }
+
     async function connectAndWrite(address, port) {
         /** @type {import("@cloudflare/workers-types").Socket} */
         const tcpSocket = connect({
@@ -187,21 +274,38 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
 
     // if the cf connect tcp socket have no incoming data, we retry to redirect ip
     async function retry() {
-        const tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote)
-        // no matter retry success or not, close websocket
-        tcpSocket.closed.catch(error => {
-            console.log('retry tcpSocket closed error', error);
-        }).finally(() => {
+        try {
+            const resolvedAddress = await resolveToIP(proxyIP || addressRemote);
+            if (!resolvedAddress) {
+                throw new Error(`no ip for ${proxyIP || addressRemote}`);
+            }
+            const tcpSocket = await connectAndWrite(resolvedAddress, proxyPort || portRemote);
+            tcpSocket.closed
+                .catch((error) => {
+                    console.log("retry tcpSocket closed error", error);
+                })
+                .finally(() => {
+                    safeCloseWebSocket(webSocket);
+                });
+            remoteSocketToWS(tcpSocket, webSocket, vsResponseHeader, null, log);
+        } catch (error) {
+            console.log("retry error", error);
             safeCloseWebSocket(webSocket);
-        })
-        remoteSocketToWS(tcpSocket, webSocket, vsResponseHeader, null, log);
+        }
     }
 
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    try {
+        const resolvedAddress = await resolveToIP(addressRemote);
+        if (!resolvedAddress) {
+            throw new Error(`no ip for ${addressRemote}`);
+        }
+        const tcpSocket = await connectAndWrite(resolvedAddress, portRemote);
+        remoteSocketToWS(tcpSocket, webSocket, vsResponseHeader, retry, log);
+    } catch (error) {
+        console.log("connect error", error);
+        safeCloseWebSocket(webSocket);
+    }
 
-    // when remoteSocket is ready, pass to websocket
-    // remote--> ws
-    remoteSocketToWS(tcpSocket, webSocket, vsResponseHeader, retry, log);
 }
 
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
@@ -268,7 +372,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
 // https://github.com/zizifn/excalidraw-backup/blob/main/v2ray-protocol.excalidraw
 
 
-async function processVlessHeader(
+async function processQistHeader(
     vsBuffer,
     userID
 ) {
@@ -494,7 +598,7 @@ function stringify(arr, offset = 0) {
 
 async function handleUDPOutBound(webSocket, vsResponseHeader, log) {
 
-    let isVlessHeaderSent = false;
+    let isQistHeaderSent = false;
     const transformStream = new TransformStream({
         start(controller) {
 
@@ -533,11 +637,11 @@ async function handleUDPOutBound(webSocket, vsResponseHeader, log) {
             const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
             if (webSocket.readyState === WS_READY_STATE_OPEN) {
                 log(`doh success and dns message length is ${udpSize}`);
-                if (isVlessHeaderSent) {
+                if (isQistHeaderSent) {
                     webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
                 } else {
                     webSocket.send(await new Blob([vsResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-                    isVlessHeaderSent = true;
+                    isQistHeaderSent = true;
                 }
             }
         }
@@ -555,9 +659,9 @@ async function handleUDPOutBound(webSocket, vsResponseHeader, log) {
 }
 
 
-function getVSConfig(userID, hostName) {
-    const wvlessws = `vless://${userID}\u0040${hostName}:80?encryption=none&security=none&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#${hostName}`;
-    const pvlesswstls = `vless://${userID}\u0040${hostName}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&fp=random&path=%2F%3Fed%3D2560#${hostName}`;
+function getQistConfig(userID, hostName) {
+    const Qistws = `vless://${userID}\u0040${hostName}:80?encryption=none&security=none&type=ws&host=${hostName}&path=%2F%3Fed%3D2560#${hostName}`;
+    const Qistwstls = `vless://${userID}\u0040${hostName}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&fp=random&path=%2F%3Fed%3D2560#${hostName}`;
     const note = `正在使用的ProxyIP：${proxyIP}`;
     if (hostName.includes('pages.dev')) {
         return `
@@ -566,7 +670,7 @@ ${note}
 ################################################################
 CF-pages-vless+ws+tls节点，分享链接如下：
 
-${pvlesswstls}
+${Qistwstls}
 
 ---------------------------------------------------------------
 注意：如果 ${hostName} 在本地网络打不开（中国移动用户注意），客户端必须开启切片功能
@@ -589,7 +693,7 @@ ${note}
 ################################################################
 一、CF-workers-vless+ws节点，分享链接如下：
 
-${wvlessws}
+${Qistws}
 
 ---------------------------------------------------------------
 注意：当前节点无需使用CF解析完成的域名，客户端选项的TLS选项必须关闭
@@ -606,7 +710,7 @@ ${wvlessws}
 ################################################################
 二、CF-workers-vless+ws+tls 或者 CF-pages-vless+ws+tls节点，分享链接如下：
 
-${pvlesswstls}
+${Qistwstls}
 
 ---------------------------------------------------------------
 注意：使用workers域名开启TLS，客户端必须开启切片功能
